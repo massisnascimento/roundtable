@@ -25,6 +25,7 @@ simple = NoAxes() + NoLegend()
 # Loading Seurat objects
 ```{r}
 object_path = "../objects/"
+#Downlodaded data from UCSC cell browser as .rds seurat objects:
 
 micro_2d = readRDS(paste0(object_path, "2d_cb.rds")) # microglia in 2D culture
 micro_induced = readRDS(paste0(object_path, "img_cb.rds")) # induced microglia
