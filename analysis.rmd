@@ -1,0 +1,576 @@
+---
+title: "Roundtable Exercise"
+author: Marcos Nascimento
+output: 
+  html_notebook: 
+    fig_width: 10
+    fig_height: 8
+---
+
+# Setup
+Loading packages and creating variables
+```{r setup}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(stringr)
+library(viridis)
+library(matrixStats)
+library(MetBrewer)
+set.seed(123)
+
+simple = NoAxes() + NoLegend()
+```
+
+# Loading Seurat objects
+```{r}
+object_path = "../objects/"
+
+micro_2d = readRDS(paste0(object_path, "2d_cb.rds")) # microglia in 2D culture
+micro_induced = readRDS(paste0(object_path, "img_cb.rds")) # induced microglia
+micro_invivo = readRDS(paste0(object_path, "invivo_cb.rds")) # mouse transplanted microglia
+micro_org = readRDS(paste0(object_path, "seurat.rds")) # microglia purified after organoid transplantation
+dev_micro = readRDS(paste0(object_path, "biccn_cb.rds")) # microglia from the developing brain
+organoids = readRDS(paste0(object_path, "org_mg_cb.rds")) # organoids treated with and without microglia
+
+dev_micro@meta.data[, "clusters2"] = dev_micro@meta.data[, "clusters"] # Making the cluster information on all datasets to be under the same column name ("clusters2")
+```
+
+#Fixing gene names in micro_org dataset
+For some reason, gene names in this dataset referred to two different reference genomes, a human one (GRCh38) and a mouse one (mm10). Since all the cells in this dataset are coming from human subjects, it must have been an error during alignment of the reads. In order to make comparisons between datasets easier, I decided to remove the prefix from gene names, so they are consistent across datasets.
+```{r}
+rownames(micro_org) %>% grep("GRCh38", .) %>% length() #20468 genes aligned to the human genome
+rownames(micro_org) %>% grep("mm10", ., value = T) %>% length() #639 genes aligned to the mouse genome 
+
+#For the sake of record keeping of the data on its original format, I transferred the SCT assay to a new assay called SCT_original
+micro_org@assays$SCT_old = micro_org@assays$SCT
+
+#And I will change the names on the SCT assay
+micro_org@assays$SCT@data@Dimnames[[1]] = gsub("GRCh38-", "", micro_org@assays$SCT@data@Dimnames[[1]])
+micro_org@assays$SCT@counts@Dimnames[[1]] = gsub("GRCh38-", "", micro_org@assays$SCT@counts@Dimnames[[1]])
+```
+# Putting datasets in a list
+I decided to put all datasets on lists in order to use lapply() for applying the same funcions to each dataset.
+```{r}
+datasets_names = c("pMG (GW18-23) in 2D culture", 
+               "iMG in 2D culture", 
+               "pMG (GW23) in organoid",
+               "iMG in the mouse brain", 
+               "MG from GW16-27 brains",
+               "Organoids (with and without pMG)")
+
+exp = c(micro_2d, micro_induced,  micro_org, micro_invivo, dev_micro, organoids)
+
+
+for(d in 1:length(exp)) {
+  exp[[d]]@meta.data$dataset = factor(datasets_names[d], levels = datasets_names)
+}
+
+names(exp) = datasets_names
+
+mg.exp = exp[1:5]
+
+# Creating a single seurat object with all experiments to make some comparisions easier to perform:
+merged.exp = merge(exp[[1]], exp[[2]])
+for(e in 3:length(exp)) {
+  merged.exp = merge(merged.exp, exp[[e]])
+}
+merged.exp$dataset = factor(merged.exp$dataset, levels = datasets_names)
+
+mg.merged.exp = merge(mg.exp[[1]], mg.exp[[2]])
+for(e in 3:length(mg.exp)) {
+  mg.merged.exp = merge(mg.merged.exp, mg.exp[[e]])
+}
+mg.merged.exp$dataset = factor(mg.merged.exp$dataset, levels = datasets_names)
+```
+
+## Overview DimPlots
+Checking the basic cluster structure of each dataset
+```{r fig.height=10, fig.width=12}
+plots = lapply(exp, DimPlot, label = T)
+for(p in 1:length(plots)) {
+  plots[[p]] = plots[[p]] + coord_fixed() + simple + labs(title = names(plots[p])) + theme(plot.title = element_text(hjust = 0.5))
+}
+
+wrap_plots(plots)
+```
+#Checking the complexity of the different datasets
+```{r}
+VlnPlot(merged.exp, group.by = "dataset", "nFeature_RNA")
+```
+
+
+# Identifying AD GWAS hits
+Based on Bellenguez et al., Nat Genet (2022), let's investigate the expression of some genes that seem to be associated with AD pathology.
+```{r}
+Table_1 <- read_csv("../hits_tables/Table_1.csv") #Table 1 corresponds to known genes
+Table_2 <- read_csv("../hits_tables/Table_2.csv") #Table 2 corresponds to new genes/loci discovered in the study
+
+# We don't really care from which table these genes are coming from, so let's make a vector with all the genes in these two tables;
+hits = c(Table_1$Gene, Table_2$Gene) %>% unique() 
+hits[62] = "IGH" #The original notation was IGH gene cluster
+
+```
+
+# Addressing questions given in the exercise
+## 1. Which genes are, based on these data, likely to function in microglia?
+```{r fig.height=15, fig.width=6}
+microglia.data = data.frame()
+for (d in 1:length(mg.exp)) {
+  current.data = mg.exp[[d]]@assays$SCT@data %>% 
+          as.data.frame() %>% 
+          rownames_to_column(var =  "gene") %>% 
+          filter(gene %in% hits) %>% 
+          mutate(mean = rowMeans(select(., -gene)), 
+                 dataset = names(mg.exp)[d], 
+                 pct = rowSums(. > 0) / ncol(.)) %>% 
+          select(gene, mean, pct, dataset)
+  
+  microglia.data = rbind(microglia.data, current.data)
+}
+
+gene_levels = microglia.data %>% pivot_wider(names_from = gene, values_from = mean) %>% select(3:77) %>% colSums(na.rm = T) %>% sort(decreasing = F) %>% names()
+
+microglia.data$gene = factor(microglia.data$gene, levels = gene_levels)
+microglia.data$dataset = factor(microglia.data$dataset, levels = names(exp)[1:5])
+
+ggplot(microglia.data, aes(dataset, gene, col = mean, size = pct)) + 
+  geom_point() + 
+  scale_color_viridis(option = "magma", 
+                      name = "Mean Expression", 
+                      limits = c(0, 2), 
+                      na.value = (viridis(n = 5, option = "magma"))[5]) + 
+  scale_size(range = c(0, 8), limits = c(0, 1), breaks = seq(0, 1, 0.25), name = "Percentage expressing", labels = c("0%", "25%", "50%", "75%", "100%")) + 
+  theme_minimal() + 
+  theme(panel.grid = element_blank(), 
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y = element_blank())
+
+
+```
+### Heatmap
+```{r}
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(circlize)
+library(pals)
+
+heatmap.data = mg.merged.exp@assays$SCT@data[gene_levels, ] %>% as.data.frame()
+
+num_cellsperdataset_to_keep <- 400 # I want to give each dataset equal weights in the heatmap so we can have more meaningful comparisons
+heatmap_datasets = datasets_names[1:5]
+
+cells_to_keep = c()
+for(d in heatmap_datasets) {
+  cells_to_keep = c(cells_to_keep, sample(rownames(mg.merged.exp@meta.data %>% filter(dataset == d)), 
+                                                                            size = num_cellsperdataset_to_keep, 
+                                                                            replace = F))
+  }
+
+heatmap.data_down = heatmap.data[, cells_to_keep]
+heatmap.data_down[is.na(heatmap.data_down)] = 0
+
+col_groups = mg.merged.exp@meta.data[cells_to_keep, c("dataset", "clusters2")]
+col_groups$dataset = col_groups$dataset %>% gsub("pMG \\Q(\\EGW18-23\\Q)\\E in 2D culture", "pMG in 2D", .) %>% 
+                                            gsub("pMG \\Q(\\EGW23\\Q)\\E in organoid", "pMG in organoids", .) %>%
+                                            gsub("iMG in 2D culture", "iMG in 2D", .) %>% 
+                                            gsub("iMG in the mouse brain", "iMG in mouse brain", .) %>% 
+                                            factor(., levels = c("pMG in 2D", "iMG in 2D", "pMG in organoids", "iMG in mouse brain", "MG from GW16-27 brains"))
+
+#Defining colorscales to be used in the heatmap:
+magma_fun = colorRamp2(seq(0, 4, 0.5), magma(9))
+viridis_fun = colorRamp2(seq(0, 6000, 600), viridis(11))
+cluster_colors = glasbey()[1:30]
+names(cluster_colors) = unique(col_groups$clusters2)
+dataset_colors = (met.brewer("Egypt", n = 5))[1:5]
+names(dataset_colors) = levels(col_groups$dataset)
+
+mg_gene_order = heatmap.data_down %>% rowSums(na.rm = T) %>% sort(decreasing = T) %>%  names() #Ordering genes based on their total heatmap expression.
+
+ta = HeatmapAnnotation(Model = col_groups$dataset,
+                       Cluster = col_groups$clusters2,
+                       col = list(Model = dataset_colors,
+                                  Cluster = cluster_colors))
+
+#n_features = mg.merged.exp@meta.data[cells_to_keep, "nFeature_RNA"]
+#ba = HeatmapAnnotation(gene_count = n_features, col = list(gene_count = viridis_fun)) # To add an annotation to the heatmap showing the number of genes in each cell. Decided to not use it
+
+
+heatmap.data_down %>% Heatmap(cluster_columns = F, 
+                              show_column_names = F, 
+                              clustering_distance_rows = "manhattan",
+                              #row_km = 6,
+                              #row_order = ad_gene_order,
+                              row_order = mg_gene_order,
+                              row_names_side = "left",
+                              column_split = col_groups,
+                              column_title_rot = 90,
+                              column_gap = unit(c(rep(0, 8),
+                                                  2,
+                                                  rep(0, 7),
+                                                  2,
+                                                  rep(0, 19),
+                                                  2,
+                                                  rep(0, 10),
+                                                  20,
+                                                  rep(0, 5),
+                                                  1), "mm"),
+                              border = T,
+                              col = magma_fun,
+                              row_title = "AD GWAS hits",
+                              column_title = NULL,
+                              name = "Gene Expression",
+                              #bottom_annotation = ba,
+                              top_annotation = ta) 
+```
+
+
+### Feature Plots
+```{r fig.height=10, fig.width=12}
+plots = lapply(mg.exp, FeaturePlot, order = T, "HLA-DQA1")
+for(p in 1:length(plots)) {
+  plots[[p]] = plots[[p]] + 
+    scale_color_viridis(option = "magma", limits = c(0, 4)) + 
+    coord_fixed() + 
+    NoAxes() + 
+    labs(title = names(plots[p])) + 
+    theme(plot.title = element_text(hjust = 0.5))
+}
+
+wrap_plots(plots)
+```
+
+### Downloading a couple of additional datasets 
+```{r}
+#siletti et al 2022 is the preprint of the newest brain atlas, with 3M cells in total, 90k MG cells.
+siletti.exp <- readRDS("../objects/siletti_2022/local.rds")
+
+siletti.exp@meta.data
+siletti.exp %>% DimPlot(group.by = "cluster_id", label = T, shuffle = T)
+
+
+#The Seattle Alzheimer's Disease Brain Cell Atlas (SEA-AD) consortium released an atlas of AD patients:
+sea_ad.exp <- readRDS("../objects/sea_ad/local.rds")
+
+#In these two datasets, gene names are in Ensembl accession names. To convert to standard gene names:
+library(biomaRt)
+
+#Siletti dataset
+    # Connect to the Ensembl database
+    ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+    
+    # Define the list of Ensembl gene IDs to convert
+    ensembl_ids <- siletti.exp %>% rownames()
+    
+    # Retrieve the gene names for the Ensembl IDs
+    results <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"), 
+                     filters = "ensembl_gene_id", 
+                     values = ensembl_ids, 
+                     mart = ensembl)
+    
+    # Print the results
+    results
+    
+    
+    #For the sake of record keeping of the data on its original format, I transferred the RNA assay to a new assay called RNA_old
+    siletti.exp@assays$RNA_old = siletti.exp@assays$RNA
+    
+    #And I will change the names on the new RNA assay
+    for(g in 1:nrow(results)) {
+      siletti.exp@assays$RNA@data@Dimnames[[1]] = gsub(results$ensembl_gene_id[g], 
+                                                       results$external_gene_name[g], 
+                                                       siletti.exp@assays$RNA@data@Dimnames[[1]])
+    }
+    
+siletti_heatmap.data = siletti.exp@assays$RNA@data[gene_levels, ] %>% as.data.frame()
+
+#SEA-AD dataset
+    # Define the list of Ensembl gene IDs to convert
+    ensembl_ids <- sea_ad.exp %>% rownames()
+    
+    # Retrieve the gene names for the Ensembl IDs
+    results <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"), 
+                     filters = "ensembl_gene_id", 
+                     values = ensembl_ids, 
+                     mart = ensembl)
+    
+    # Print the results
+    results
+    
+    
+    #For the sake of record keeping of the data on its original format, I transferred the RNA assay to a new assay called RNA_old
+    sea_ad.exp@assays$RNA_old = sea_ad.exp@assays$RNA
+    
+    #And I will change the names on the new RNA assay
+    for(g in 1:nrow(results)) {
+      sea_ad.exp@assays$RNA@data@Dimnames[[1]] = gsub(results$ensembl_gene_id[g], 
+                                                       results$external_gene_name[g], 
+                                                       sea_ad.exp@assays$RNA@data@Dimnames[[1]])
+    }
+```
+
+```{r}
+sea_ad_heatmap.data = sea_ad.exp@assays$RNA@data[gene_levels, ] %>% as.data.frame()
+
+num_cellsperbraak_to_keep <- 285 # I want to give each dataset equal weights in the heatmap so we can have more meaningful comparisons
+
+
+cells_to_keep = c()
+for(b in unique(sea_ad.exp$`Braak stage`)) {
+  cells_to_keep = c(cells_to_keep, sample(rownames(sea_ad.exp@meta.data %>% filter(`Braak stage` == b)), 
+                                                                            size = num_cellsperbraak_to_keep, 
+                                                                            replace = F))
+  }
+
+ad_gene_order = sea_ad_heatmap.data %>% rowSums(na.rm = T) %>% sort(decreasing = T) %>%  names()
+
+sea_ad_heatmap.data_down = sea_ad_heatmap.data[, cells_to_keep]
+
+col_groups = sea_ad.exp@meta.data[cells_to_keep, c("Braak stage")]
+
+magma_fun = colorRamp2(seq(0, 4, 0.5), magma(9))
+viridis_fun = colorRamp2(seq(0, 6000, 600), viridis(11))
+braak_colors = viridis(7)
+names(braak_colors) = levels(col_groups)
+
+
+
+ta = HeatmapAnnotation(Stage = col_groups, border = T,
+                       col = list(Stage = braak_colors))
+                       
+#ba = HeatmapAnnotation(gene_count = n_features, col = list(gene_count = viridis_fun))
+
+
+sea_ad_heatmap.data_down %>% Heatmap(cluster_columns = T, 
+                              cluster_column_slices = F,
+                              show_column_names = F, 
+                              show_column_dend = F,
+                              #clustering_distance_rows = "manhattan",
+                              #row_km = 6,
+                              row_order = ad_gene_order,
+                              row_names_side = "left",
+                              column_split = col_groups,
+                              #column_title_rot = 90,
+                              column_gap = unit(2, "mm"),
+                              border = T,
+                              col = magma_fun,
+                              row_title = "AD GWAS hits",
+                              #column_title = NULL,
+                              name = "Gene Expression",
+                              #bottom_annotation = ba,
+                              top_annotation = ta) 
+
+
+```
+### Combined heatmaps
+Microglial models from Popova et al + SEA-AD data
+```{r}
+num_cellsperdataset_to_keep <- 333 # I want to give each dataset equal weights in the heatmap so we can have more meaningful comparisons
+heatmap_datasets = datasets_names[1:5]
+
+mg.cells_to_keep = c()
+for(d in heatmap_datasets) {
+  mg.cells_to_keep = c(mg.cells_to_keep, sample(rownames(mg.merged.exp@meta.data %>% filter(dataset == d)), 
+                                                                            size = num_cellsperdataset_to_keep, 
+                                                                            replace = F))
+  }
+
+heatmap.data_down = heatmap.data[, mg.cells_to_keep]
+heatmap.data_down[is.na(heatmap.data_down)] = 0
+
+sea_ad_heatmap.data = sea_ad.exp@assays$RNA@data[gene_levels, ] %>% as.data.frame()
+
+sea_ad_cells_to_keep = sample(rownames(sea_ad.exp@meta.data),size = num_cellsperdataset_to_keep,replace = F)
+
+sea_ad_heatmap.data_down = sea_ad_heatmap.data[, sea_ad_cells_to_keep]
+
+comb.heatmap.data = cbind(heatmap.data_down, sea_ad_heatmap.data_down)
+
+col_groups = mg.merged.exp@meta.data[cells_to_keep, c("dataset", "clusters2")]
+col_groups$dataset = col_groups$dataset %>% gsub("pMG \\Q(\\EGW18-23\\Q)\\E in 2D culture", "pMG in 2D", .) %>% 
+                                            gsub("pMG \\Q(\\EGW23\\Q)\\E in organoid", "pMG in organoids", .) %>%
+                                            gsub("iMG in 2D culture", "iMG in 2D", .) %>% 
+                                            gsub("iMG in the mouse brain", "iMG in mouse brain", .)
+                                            
+col_groups[sea_ad_cells_to_keep, "dataset"] = "SEA-AD"
+col_groups[sea_ad_cells_to_keep, "clusters2"] = sea_ad.exp@meta.data[sea_ad_cells_to_keep, "Braak stage"] 
+col_groups$dataset = col_groups$dataset %>% factor(., levels = c("pMG in 2D", "iMG in 2D", "pMG in organoids", "iMG in mouse brain", "MG from GW16-27 brains", "SEA-AD"))
+
+#Defining colorscales to be used in the heatmap:
+magma_fun = colorRamp2(seq(0, 4, 0.5), magma(9))
+viridis_fun = colorRamp2(seq(0, 6000, 600), viridis(11))
+cluster_colors = glasbey()[1:30]
+#names(cluster_colors) = unique(col_groups$clusters2)
+dataset_colors = (met.brewer("Egypt", n = 6))[1:6]
+names(dataset_colors) = levels(col_groups$dataset)
+
+
+ta = HeatmapAnnotation(Dataset = col_groups$dataset,
+                       #Cluster = col_groups$clusters2,
+                       col = list(Dataset = dataset_colors))
+                                  #Cluster = cluster_colors))
+
+#n_features = mg.merged.exp@meta.data[cells_to_keep, "nFeature_RNA"]
+#ba = HeatmapAnnotation(gene_count = n_features, col = list(gene_count = viridis_fun)) # To add an annotation to the heatmap showing the number of genes in each cell. Decided to not use it
+
+
+comb.heatmap.data %>% Heatmap(cluster_columns = T,
+                              cluster_column_slices = F,
+                              show_column_dend = F,
+                              show_column_names = F, 
+                              clustering_distance_rows = "manhattan",
+                              #row_km = 6,
+                              #row_order = ad_gene_order,
+                              row_order = ad_gene_order,
+                              row_names_side = "left",
+                              column_split = col_groups$dataset,
+                              column_title_rot = 90,
+                              column_gap = unit(c(2, 2, 2, 30, 2), "mm"),
+                              border = T,
+                              col = magma_fun,
+                              row_title = "AD GWAS hits",
+                              column_title = NULL,
+                              name = "Gene Expression",
+                              #bottom_annotation = ba,
+                              top_annotation = ta) 
+```
+## 2
+2. Which genes can be modeled in simpler 2D systems and which require more complex organoid or xenotransplantation? 
+
+```{r}
+cells_2d = mg.merged.exp@meta.data %>% filter(dataset %in% c("pMG (GW18-23) in 2D culture", "iMG in 2D culture")) %>% rownames()
+cells_3d = mg.merged.exp@meta.data %>% filter(dataset %in% c("pMG (GW23) in organoid", "iMG in the mouse brain")) %>% rownames()
+
+mg.merged.exp@meta.data[cells_2d, "model"] = "2d"
+mg.merged.exp@meta.data[cells_3d, "model"] = "3d"
+
+Idents(mg.merged.exp) = "model"
+
+models.de.genes = FindAllMarkers(mg.merged.exp, features = gene_levels, recorrect_umi=FALSE)
+```
+
+## 3
+3. Is the expression of the AD hits enriched in any subtypes of microglia that exist in the various systems?
+```{r}
+
+#de.genes = lapply(mg.exp, FindAllMarkers, features = gene_levels) # This would be the easiest way of doing this but if your gene list has any gene that is absent in the original dataset, it throws an error. So we have to use an annoying for loop:
+de.genes = list()
+for(d in 1: 4) {
+  de.genes[[d]] = FindAllMarkers(mg.exp[[d]], features = intersect(rownames(mg.exp[[d]]), gene_levels), only.pos = T)
+} # It's also important to keep in mind that we shouldn't run DE tests on non-linear transformed data (SCT normalized). Unfortunately, I had no access to the raw counts matrix. This test is not what I would do on an ideal scenario.
+                  
+de.genes[[1]] %>%  pull(gene) %>% unique() %>%  length() #23 DE genes
+de.genes[[2]] %>%  pull(gene) %>% unique() %>%  length() #18 DE genes
+de.genes[[3]] %>%  pull(gene) %>% unique() %>%  length() #21 DE genes
+de.genes[[4]] %>%  pull(gene) %>% unique() %>%  length() #8 DE genes
+
+
+trem2_plots = lapply(mg.exp, FeaturePlot, order = T, "TREM2")
+
+for(p in 1:4) {
+  trem2_plots[[p]] = trem2_plots[[p]] + 
+    scale_color_viridis(option = "magma", limits = c(0, 4)) + 
+    coord_fixed() + 
+    NoAxes() + 
+    labs(title = names(trem2_plots[p])) + 
+    theme(plot.title = element_text(hjust = 0.5))
+}
+
+wrap_plots(trem2_plots[1:4]) + plot_layout(ncol = 2)
+
+hla_plots = lapply(mg.exp, FeaturePlot, order = T, "HLA-DQA1")
+
+for(p in 1:4) {
+  hla_plots[[p]] = hla_plots[[p]] + 
+    scale_color_viridis(option = "magma", limits = c(0, 4)) + 
+    coord_fixed() + 
+    NoAxes() + 
+    labs(title = names(hla_plots[p])) + 
+    theme(plot.title = element_text(hjust = 0.5))
+}
+
+wrap_plots(hla_plots[1:4]) + plot_layout(ncol = 2)
+
+```
+
+## 4
+4. Which of the genes are expressed in cell types of organoids (including non-microglia)? 
+Of these, how does their expression depend on the presence of microglia? 
+### Heatmap
+```{r}
+exp[[6]]@meta.data
+
+heatmap.data = exp[[6]]@assays$SCT@data[intersect(rownames(exp[[6]]), gene_levels), ] %>% as.data.frame()
+
+num_cells_to_keep <- 2000 # I want to give each dataset equal weights in the heatmap so we can have more meaningful comparisons
+
+cells_to_keep = c()
+cells_to_keep = sample(rownames(exp[[6]]@meta.data), size = num_cells_to_keep, replace = F)
+
+heatmap.data_down = heatmap.data[, cells_to_keep]
+heatmap.data_down[is.na(heatmap.data_down)] = 0
+
+col_groups = exp[[6]]@meta.data[cells_to_keep, c("clusters", "MG")]
+
+#Defining colorscales to be used in the heatmap:
+magma_fun = colorRamp2(seq(0, 4, 0.5), magma(9))
+
+cluster_colors = (met.brewer("Egypt", n = 5))[1:5]
+names(cluster_colors) = unique(col_groups$clusters)
+
+mg_colors = c("MG" = "#F8766D", "NoMG" = "#03BFC4")
+
+org_gene_order = heatmap.data_down %>% rowSums(na.rm = T) %>% sort(decreasing = T) %>%  names() #Ordering genes based on their total heatmap expression
+
+ta = HeatmapAnnotation(Cluster = col_groups$clusters,
+                       MG = col_groups$MG,
+                       col = list( Cluster = cluster_colors,
+                                   MG = mg_colors))
+
+#n_features = mg.merged.exp@meta.data[cells_to_keep, "nFeature_RNA"]
+#ba = HeatmapAnnotation(gene_count = n_features, col = list(gene_count = viridis_fun)) # To add an annotation to the heatmap showing the number of genes in each cell. Decided to not use it
+
+
+heatmap.data_down %>% Heatmap(cluster_columns = T, 
+                              show_column_names = F, 
+                              cluster_column_slices = F,
+                              show_column_dend = F,
+                              row_order = org_gene_order,
+                              row_names_side = "left",
+                              column_split = col_groups,
+                              column_title_rot = 90,
+                              column_gap = unit(rep(c(1, 5), 5), "mm"),
+                              border = T,
+                              col = magma_fun,
+                              row_title = "AD GWAS hits",
+                              column_title = NULL,
+                              name = "Gene Expression",
+                              #bottom_annotation = ba,
+                              top_annotation = ta) 
+
+```
+### Feature and Dimplots
+```{r}
+exp[[6]] %>% DimPlot(group.by = c("clusters", "MG"), shuffle = T) & NoAxes() & coord_fixed()
+
+exp[[6]] %>%  FeaturePlot(c("GAD1", "GAD2", "TBR1", "SLC17A6", "TNC", "TOP2A"), order = T, col = magma(100)) & simple & coord_fixed()
+```
+### DE genes
+```{r}
+Idents(exp[[6]]) = "MG"
+cluster_names = exp[[6]]@meta.data$clusters %>% unique() # "Dividing" "EN"       "IPC"      "IN"       "RG"      
+
+cell_names = list()
+de_genes_in_org = list()
+
+for(c in 1:5) {
+  cell_names[[c]] = exp[[6]]@meta.data %>% 
+                    filter(clusters == cluster_names[c]) %>% 
+                    rownames()
+  de_genes_in_org[[c]] = exp[[6]] %>% subset(cells = cell_names[[c]]) %>%  
+                                      FindAllMarkers(features = intersect(rownames(exp[[6]]), gene_levels), only.pos = T) %>% 
+                                      mutate(cells = cluster_names[c])
+}
+
+```
+
