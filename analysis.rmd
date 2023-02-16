@@ -103,8 +103,8 @@ VlnPlot(merged.exp, group.by = "dataset", "nFeature_RNA")
 # Identifying AD GWAS hits
 Based on Bellenguez et al., Nat Genet (2022), let's investigate the expression of some genes that seem to be associated with AD pathology.
 ```{r}
-Table_1 <- read_csv("../hits_tables/Table_1.csv") #Table 1 corresponds to known genes
-Table_2 <- read_csv("../hits_tables/Table_2.csv") #Table 2 corresponds to new genes/loci discovered in the study
+Table_1 <- read_csv("Table_1.csv") #Table 1 corresponds to known genes
+Table_2 <- read_csv("Table_2.csv") #Table 2 corresponds to new genes/loci discovered in the study
 
 # We don't really care from which table these genes are coming from, so let's make a vector with all the genes in these two tables;
 hits = c(Table_1$Gene, Table_2$Gene) %>% unique() 
